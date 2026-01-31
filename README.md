@@ -1,6 +1,6 @@
 # Desktop Audio Spectrogram
 
-Display live spectrogram from desktop audio
+Visualize live spectrogram from desktop audio
 ![spectrogram](spectrogram.png)
 
 ### Controls

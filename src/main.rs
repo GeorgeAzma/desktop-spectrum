@@ -79,11 +79,28 @@ unsafe extern "system" fn window_proc(
                 unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<AppState>;
             if !state_ptr.is_null() {
                 let state = unsafe { &*state_ptr };
-                if let Ok(guard) = state.lock() {
+                if let Ok(mut guard) = state.lock() {
                     let mut client_rect = RECT::default();
                     unsafe { GetClientRect(hwnd, &mut client_rect).ok() };
                     let width = client_rect.right - client_rect.left;
                     let height = client_rect.bottom - client_rect.top;
+
+                    let mut cursor_pos = POINT::default();
+                    unsafe { GetCursorPos(&mut cursor_pos).ok() };
+                    let mut client_cursor = cursor_pos;
+                    _ = unsafe { ScreenToClient(hwnd, &mut client_cursor).ok() };
+                    let mouse_in_client = client_cursor.x >= 0
+                        && client_cursor.x < width
+                        && client_cursor.y >= 0
+                        && client_cursor.y < height;
+
+                    if mouse_in_client {
+                        guard.mouse_x = client_cursor.x;
+                        guard.mouse_y = client_cursor.y;
+                        let freq = (client_cursor.x as f32 / width as f32)
+                            * (guard.sample_rate as f32 / 2.0);
+                        guard.current_freq = freq;
+                    }
 
                     let bmi = BITMAPINFO {
                         bmiHeader: BITMAPINFOHEADER {
@@ -117,52 +134,55 @@ unsafe extern "system" fn window_proc(
                         )
                     };
 
-                    unsafe { SetBkMode(hdc, TRANSPARENT) };
+                    if mouse_in_client {
+                        unsafe { SetBkMode(hdc, TRANSPARENT) };
 
-                    let hfont = unsafe {
-                        CreateFontW(
-                            20,
-                            0,
-                            0,
-                            0,
-                            FW_SEMIBOLD.0 as i32,
-                            0,
-                            0,
-                            0,
-                            DEFAULT_CHARSET.0 as u32,
-                            OUT_DEFAULT_PRECIS.0 as u32,
-                            CLIP_DEFAULT_PRECIS.0 as u32,
-                            DEFAULT_QUALITY.0 as u32,
-                            DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-                            w!("Segoe UI"),
-                        )
-                    };
-                    unsafe { SelectObject(hdc, hfont) };
+                        let hfont = unsafe {
+                            CreateFontW(
+                                20,
+                                0,
+                                0,
+                                0,
+                                FW_SEMIBOLD.0 as i32,
+                                0,
+                                0,
+                                0,
+                                DEFAULT_CHARSET.0 as u32,
+                                OUT_DEFAULT_PRECIS.0 as u32,
+                                CLIP_DEFAULT_PRECIS.0 as u32,
+                                DEFAULT_QUALITY.0 as u32,
+                                DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+                                w!("Segoe UI"),
+                            )
+                        };
+                        unsafe { SelectObject(hdc, hfont) };
 
-                    let bitmap_x = ((guard.mouse_x as f32 / width as f32) * (FFT_SIZE as f32 / 2.0))
-                        .floor() as usize;
-                    let bitmap_y = ((guard.mouse_y as f32 / height as f32) * TIME_FRAMES as f32)
-                        .floor() as usize;
-                    let mag = if bitmap_x < FFT_SIZE / 2 && bitmap_y < TIME_FRAMES {
-                        guard.magnitudes[bitmap_y * (FFT_SIZE / 2) + bitmap_x]
-                    } else {
-                        0.0
-                    };
-                    let db = 20.0 * (mag * 2.0 / FFT_SIZE as f32 + 1e-10).log10();
+                        let bitmap_x = ((guard.mouse_x as f32 / width as f32)
+                            * (FFT_SIZE as f32 / 2.0))
+                            .floor() as usize;
+                        let bitmap_y = ((guard.mouse_y as f32 / height as f32) * TIME_FRAMES as f32)
+                            .floor() as usize;
+                        let mag = if bitmap_x < FFT_SIZE / 2 && bitmap_y < TIME_FRAMES {
+                            guard.magnitudes[bitmap_y * (FFT_SIZE / 2) + bitmap_x]
+                        } else {
+                            0.0
+                        };
+                        let db = 20.0 * (mag * 2.0 / FFT_SIZE as f32 + 1e-10).log10();
 
-                    let text = if guard.is_paused {
-                        format!("{:.0} Hz, {:.1} dB, {:.1e}", guard.current_freq, db, mag)
-                    } else {
-                        format!("{:.0} Hz", guard.current_freq)
-                    };
-                    let wide_text: Vec<u16> =
-                        text.encode_utf16().chain(std::iter::once(0)).collect();
-                    unsafe { SetTextColor(hdc, rgb(0, 0, 0)) };
-                    unsafe { TextOutW(hdc, guard.mouse_x + 2, guard.mouse_y - 18, &wide_text) };
-                    unsafe { SetTextColor(hdc, rgb(255, 255, 255)) };
-                    unsafe { TextOutW(hdc, guard.mouse_x, guard.mouse_y - 20, &wide_text) };
+                        let text = if guard.is_paused {
+                            format!("{:.0} Hz, {:.1} dB, {:.1e}", guard.current_freq, db, mag)
+                        } else {
+                            format!("{:.0} Hz", guard.current_freq)
+                        };
+                        let wide_text: Vec<u16> =
+                            text.encode_utf16().chain(std::iter::once(0)).collect();
+                        unsafe { SetTextColor(hdc, rgb(0, 0, 0)) };
+                        unsafe { TextOutW(hdc, guard.mouse_x + 2, guard.mouse_y - 18, &wide_text) };
+                        unsafe { SetTextColor(hdc, rgb(255, 255, 255)) };
+                        unsafe { TextOutW(hdc, guard.mouse_x, guard.mouse_y - 20, &wide_text) };
 
-                    unsafe { DeleteObject(hfont) };
+                        unsafe { DeleteObject(hfont) };
+                    }
                 }
             }
             unsafe { EndPaint(hwnd, &ps) };
