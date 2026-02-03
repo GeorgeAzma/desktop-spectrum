@@ -10,16 +10,22 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::*, Graphics::Gdi::*, Media::Audio::*, System::Com::*, System::LibraryLoader::*,
-        System::Threading::*, UI::Input::KeyboardAndMouse::*, UI::WindowsAndMessaging::*,
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Graphics::Gdi::*,
+        Media::Audio::{
+            AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient,
+            IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
+        },
+        System::{Com::*, Threading::Sleep},
+        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     },
     core::*,
 };
 
-mod renderer;
+// mod renderer;
 mod window;
 
-use renderer::Renderer;
+// use renderer::Renderer;
 use window::Window;
 
 pub type ResultAny<T = ()> = color_eyre::Result<T>;
@@ -83,9 +89,6 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match msg {
         WM_PAINT => {
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
-
             let state_ptr =
                 unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<AppState>;
             if !state_ptr.is_null() {
@@ -218,8 +221,6 @@ unsafe extern "system" fn window_proc(
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                     guard.mouse_x = x;
                     guard.mouse_y = y;
-
-                    unsafe { InvalidateRect(hwnd, None, false) };
 
                     let mut client_rect = RECT::default();
                     unsafe { GetClientRect(hwnd, &mut client_rect).ok() };
@@ -511,12 +512,13 @@ struct AppState {
     mouse_y: i32,
     current_freq: f32,
     is_paused: bool,
+    // renderer: Arc<Mutex<Renderer>>,
 }
 
-fn run_app(hinstance: HINSTANCE) -> Result<i32> {
+fn run_app() -> ResultAny {
     unsafe {
         let window = Window::new(1024, 768, Some(window_proc))?;
-        let renderer = Renderer::new(window.hwnd(), window.width() as u32, window.height() as u32)?;
+        // let renderer = Renderer::new(window.hwnd(), window.width() as u32, window.height() as u32)?;
 
         let state = Arc::new(Mutex::new(AppState {
             image_data: vec![0u8; (FFT_SIZE / 2) * TIME_FRAMES * 3],
@@ -531,52 +533,21 @@ fn run_app(hinstance: HINSTANCE) -> Result<i32> {
             mouse_y: 0,
             current_freq: 0.0,
             is_paused: false,
+            // renderer: Arc::new(Mutex::new(renderer)),
         }));
 
-        let class_name = w!("SpectrogramClass");
-        let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(window_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinstance,
-            hIcon: LoadIconW(None, IDI_APPLICATION).ok().unwrap(),
-            hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap(),
-            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
-            lpszMenuName: PCWSTR::null(),
-            lpszClassName: class_name,
-        };
-        RegisterClassW(&wc);
+        window.set_user_data(Arc::into_raw(state.clone()) as isize);
 
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            class_name,
-            w!("Spectrogram"),
-            WS_POPUP,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1024,
-            768,
-            None,
-            None,
-            GetModuleHandleW(None).unwrap(),
-            None,
-        );
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::into_raw(state.clone()) as isize);
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
-
+        let sendable_hwnd = window.hwnd().0 as usize;
         std::thread::spawn(move || {
-            if let Err(e) = audio_thread_loop(hwnd, &state) {
+            if let Err(e) = audio_thread_loop(sendable_hwnd, &state) {
                 eprintln!("Audio Error: {:?}", e);
             }
         });
 
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        while window.handle_events() {}
+
+        CoUninitialize();
     }
 
     Ok(())
