@@ -94,7 +94,7 @@ unsafe extern "system" fn window_proc(
             if !state_ptr.is_null() {
                 let state = unsafe { &*state_ptr };
                 if let Ok(mut guard) = state.lock() {
-                    guard.renderer.lock().unwrap().render().unwrap();
+                    // guard.renderer.lock().unwrap().render().unwrap();
 
                     let mut ps = PAINTSTRUCT::default();
                     let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
