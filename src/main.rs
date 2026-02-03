@@ -1,8 +1,11 @@
 // #![windows_subsystem = "windows"]
+#![allow(dead_code)]
+pub use color_eyre::eyre::eyre;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 use std::{
     f32::consts::PI,
-    ptr,
+    ffi::c_void,
+    ptr::null_mut,
     sync::{Arc, Mutex},
 };
 use windows::{
@@ -12,6 +15,14 @@ use windows::{
     },
     core::*,
 };
+
+mod renderer;
+mod window;
+
+use renderer::Renderer;
+use window::Window;
+
+pub type ResultAny<T = ()> = color_eyre::Result<T>;
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
@@ -80,6 +91,11 @@ unsafe extern "system" fn window_proc(
             if !state_ptr.is_null() {
                 let state = unsafe { &*state_ptr };
                 if let Ok(mut guard) = state.lock() {
+                    guard.renderer.lock().unwrap().render().unwrap();
+
+                    let mut ps = PAINTSTRUCT::default();
+                    let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+
                     let mut client_rect = RECT::default();
                     unsafe { GetClientRect(hwnd, &mut client_rect).ok() };
                     let width = client_rect.right - client_rect.left;
@@ -116,7 +132,8 @@ unsafe extern "system" fn window_proc(
                     };
 
                     unsafe {
-                        SetStretchBltMode(hdc, STRETCH_DELETESCANS);
+                        SetStretchBltMode(hdc, HALFTONE);
+                        _ = SetBrushOrgEx(hdc, 0, 0, None);
                         StretchDIBits(
                             hdc,
                             0,
@@ -147,15 +164,15 @@ unsafe extern "system" fn window_proc(
                                 0,
                                 0,
                                 0,
-                                DEFAULT_CHARSET.0 as u32,
-                                OUT_DEFAULT_PRECIS.0 as u32,
-                                CLIP_DEFAULT_PRECIS.0 as u32,
-                                DEFAULT_QUALITY.0 as u32,
+                                DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS,
+                                CLIP_DEFAULT_PRECIS,
+                                DEFAULT_QUALITY,
                                 DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
                                 w!("Segoe UI"),
                             )
                         };
-                        unsafe { SelectObject(hdc, hfont) };
+                        unsafe { SelectObject(hdc, HGDIOBJ(hfont.0)) };
 
                         let bitmap_x = ((guard.mouse_x as f32 / width as f32)
                             * (FFT_SIZE as f32 / 2.0))
@@ -177,15 +194,18 @@ unsafe extern "system" fn window_proc(
                         let wide_text: Vec<u16> =
                             text.encode_utf16().chain(std::iter::once(0)).collect();
                         unsafe { SetTextColor(hdc, rgb(0, 0, 0)) };
-                        unsafe { TextOutW(hdc, guard.mouse_x + 2, guard.mouse_y - 18, &wide_text) };
+                        _ = unsafe {
+                            TextOutW(hdc, guard.mouse_x + 2, guard.mouse_y - 18, &wide_text)
+                        };
                         unsafe { SetTextColor(hdc, rgb(255, 255, 255)) };
-                        unsafe { TextOutW(hdc, guard.mouse_x, guard.mouse_y - 20, &wide_text) };
+                        _ = unsafe { TextOutW(hdc, guard.mouse_x, guard.mouse_y - 20, &wide_text) };
 
-                        unsafe { DeleteObject(hfont) };
+                        _ = unsafe { DeleteObject(HGDIOBJ(hfont.0)) };
                     }
+                    _ = unsafe { EndPaint(hwnd, &ps) };
                 }
             }
-            unsafe { EndPaint(hwnd, &ps) };
+
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -326,7 +346,7 @@ unsafe extern "system" fn window_proc(
                             guard.is_paused = !guard.is_paused;
                         }
                     }
-                    unsafe { InvalidateRect(hwnd, None, false) };
+                    _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                 }
                 VK_T => {
                     let state_ptr =
@@ -343,7 +363,7 @@ unsafe extern "system" fn window_proc(
                             unsafe {
                                 SetWindowPos(
                                     hwnd,
-                                    hwnd_insert_after,
+                                    Some(hwnd_insert_after),
                                     0,
                                     0,
                                     0,
@@ -367,16 +387,14 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn audio_thread_loop(
-    hwnd: HWND,
-    state: &Arc<Mutex<AppState>>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn audio_thread_loop(hwnd: usize, state: &Arc<Mutex<AppState>>) -> ResultAny {
+    let hwnd = HWND(hwnd as *mut c_void);
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
 
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+        let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
 
         let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
 
@@ -409,11 +427,11 @@ fn audio_thread_loop(
             let packet_frames = capture.GetNextPacketSize()?;
 
             if packet_frames == 0 {
-                Sleep(1);
+                Sleep(0);
                 continue;
             }
 
-            let mut data_ptr = ptr::null_mut();
+            let mut data_ptr = null_mut();
             let mut frames = 0;
             let mut flags = 0;
 
@@ -471,7 +489,7 @@ fn audio_thread_loop(
                         guard.magnitudes[0..W].copy_from_slice(&mag_column);
                     }
 
-                    InvalidateRect(hwnd, None, false);
+                    InvalidateRect(Some(hwnd), None, false).unwrap();
                 }
             }
 
@@ -497,6 +515,9 @@ struct AppState {
 
 fn run_app(hinstance: HINSTANCE) -> Result<i32> {
     unsafe {
+        let window = Window::new(1024, 768, Some(window_proc))?;
+        let renderer = Renderer::new(window.hwnd(), window.width() as u32, window.height() as u32)?;
+
         let state = Arc::new(Mutex::new(AppState {
             image_data: vec![0u8; (FFT_SIZE / 2) * TIME_FRAMES * 3],
             magnitudes: vec![0.0; (FFT_SIZE / 2) * TIME_FRAMES],
@@ -558,11 +579,11 @@ fn run_app(hinstance: HINSTANCE) -> Result<i32> {
         }
     }
 
-    Ok(0)
+    Ok(())
 }
 
-fn main() {
-    unsafe { SetProcessDPIAware().unwrap() };
-    let hinstance = unsafe { GetModuleHandleW(None).unwrap() };
-    run_app(hinstance.into()).unwrap();
+fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
+    _ = unsafe { SetProcessDPIAware() };
+    Ok(run_app()?)
 }
