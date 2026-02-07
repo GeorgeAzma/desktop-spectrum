@@ -29,7 +29,7 @@ impl Window {
             hInstance: HINSTANCE(hinstance.0),
             hIcon: unsafe { LoadIconW(None, IDI_APPLICATION) }?,
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }?,
-            hbrBackground: HBRUSH(unsafe { GetStockObject(BLACK_BRUSH).0 }),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszMenuName: PCWSTR::null(),
             lpszClassName: class_name,
         };
@@ -107,6 +107,8 @@ impl Window {
 
     pub fn handle_events(&self) -> bool {
         let mut msg = MSG::default();
+        // Block until a message arrives, avoiding busy-spin
+        unsafe { WaitMessage().ok() };
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() } {
             if msg.message == WM_QUIT {
                 return false;

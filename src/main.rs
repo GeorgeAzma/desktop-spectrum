@@ -8,36 +8,29 @@ use std::{
     ptr::null_mut,
     sync::{Arc, Mutex},
 };
-use windows::{
-    Win32::{
-        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-        Graphics::Gdi::*,
-        Media::Audio::{
-            AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient,
-            IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
-        },
-        System::{Com::*, Threading::Sleep},
-        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+use windows::Win32::{
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+    Graphics::Gdi::{InvalidateRect, ScreenToClient, ValidateRect},
+    Media::Audio::{
+        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient,
+        IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
     },
-    core::*,
+    System::{Com::*, Threading::Sleep},
+    UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
-// mod renderer;
+mod renderer;
 mod window;
 
-// use renderer::Renderer;
+use renderer::D2DRenderer;
 use window::Window;
 
 pub type ResultAny<T = ()> = color_eyre::Result<T>;
 
-const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
-}
-
 const FFT_SIZE: usize = 4096;
 const HOP_SIZE: usize = FFT_SIZE / 4;
-const TIME_FRAMES: usize = 512;
-const MAX_HZ: f32 = 20000.0;
+const TIME_FRAMES: usize = 256;
+const MAX_HZ: f32 = 15000.0;
 
 /// Number of FFT bins to display, clamped to MAX_HZ.
 fn display_bins(sample_rate: u32) -> usize {
@@ -67,7 +60,7 @@ fn cola_normalization_scalar(window: &[f32], hop_size: usize) -> f32 {
     norm.iter().sum::<f32>() / norm.len() as f32
 }
 
-fn sample_to_color(magnitude: f32) -> [u8; 3] {
+fn sample_to_color(magnitude: f32) -> [u8; 4] {
     let magnitude = magnitude / FFT_SIZE as f32;
     let log_val = 20.0 * (magnitude + 1e-10).log10();
 
@@ -83,7 +76,7 @@ fn sample_to_color(magnitude: f32) -> [u8; 3] {
     let g = (g.clamp(0.0, 1.0) * 255.0) as u8;
     let b = (b.clamp(0.0, 1.0) * 255.0) as u8;
 
-    [b, g, r]
+    [b, g, r, 255]
 }
 
 fn stft(buffer: &[f32], window: &[f32], fft: &Arc<dyn Fft<f32>>) -> Vec<Complex<f32>> {
@@ -117,17 +110,15 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
-            let state_ptr =
-                unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<AppState>;
-            if !state_ptr.is_null() {
-                let state = unsafe { &*state_ptr };
-                if let Ok(mut guard) = state.lock() {
-                    // guard.renderer.lock().unwrap().render().unwrap();
+            let ws_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ws_ptr.is_null() {
+                let ws = unsafe { &mut *ws_ptr };
 
-                    let mut ps = PAINTSTRUCT::default();
-                    let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
-
+                // Snapshot shared state under the lock, then drop it before rendering.
+                let snapshot = {
+                    let mut guard = ws.state.lock().unwrap();
                     let mut client_rect = RECT::default();
                     unsafe { GetClientRect(hwnd, &mut client_rect).ok() };
                     let width = client_rect.right - client_rect.left;
@@ -150,102 +141,52 @@ unsafe extern "system" fn window_proc(
                     }
 
                     let db = display_bins(guard.sample_rate);
+                    let ring_head = guard.ring_head;
 
-                    let bmi = BITMAPINFO {
-                        bmiHeader: BITMAPINFOHEADER {
-                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                            biWidth: FFT_SIZE as i32 / 2,
-                            biHeight: -(TIME_FRAMES as i32),
-                            biPlanes: 1,
-                            biBitCount: 24,
-                            biCompression: BI_RGB.0,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-
-                    unsafe {
-                        SetStretchBltMode(hdc, HALFTONE);
-                        _ = SetBrushOrgEx(hdc, 0, 0, None);
-                        StretchDIBits(
-                            hdc,
-                            0,
-                            0,
-                            width,
-                            height,
-                            0,
-                            0,
-                            db as i32,
-                            TIME_FRAMES as i32,
-                            Some(guard.image_data.as_ptr() as *const _),
-                            &bmi,
-                            DIB_RGB_COLORS,
-                            SRCCOPY,
-                        )
-                    };
-
-                    if mouse_in_client {
-                        unsafe { SetBkMode(hdc, TRANSPARENT) };
-
-                        let hfont = unsafe {
-                            CreateFontW(
-                                20,
-                                0,
-                                0,
-                                0,
-                                FW_SEMIBOLD.0 as i32,
-                                0,
-                                0,
-                                0,
-                                DEFAULT_CHARSET,
-                                OUT_DEFAULT_PRECIS,
-                                CLIP_DEFAULT_PRECIS,
-                                DEFAULT_QUALITY,
-                                DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-                                w!("Segoe UI"),
-                            )
-                        };
-                        unsafe { SelectObject(hdc, HGDIOBJ(hfont.0)) };
-
+                    let text = if mouse_in_client {
                         let bitmap_x =
                             ((guard.mouse_x as f32 / width as f32) * db as f32).floor() as usize;
-                        let bitmap_y = ((guard.mouse_y as f32 / height as f32) * TIME_FRAMES as f32)
+                        let visual_y = ((guard.mouse_y as f32 / height as f32) * TIME_FRAMES as f32)
                             .floor() as usize;
-                        let mag = if bitmap_x < db && bitmap_y < TIME_FRAMES {
-                            guard.magnitudes[bitmap_y * (FFT_SIZE / 2) + bitmap_x]
+                        let buffer_y = (ring_head + visual_y) % TIME_FRAMES;
+                        let mag = if bitmap_x < db && visual_y < TIME_FRAMES {
+                            guard.magnitudes[buffer_y * (FFT_SIZE / 2) + bitmap_x]
                         } else {
                             0.0
                         };
-                        let db = 20.0 * (mag * 2.0 / FFT_SIZE as f32 + 1e-10).log10();
-
-                        let text = if guard.is_paused {
-                            format!("{:.0} Hz, {:.1} dB, {:.1e}", guard.current_freq, db, mag)
+                        let db_val = 20.0 * (mag * 2.0 / FFT_SIZE as f32 + 1e-10).log10();
+                        if guard.is_paused {
+                            format!(
+                                "{:.0} Hz, {:.1} dB, {:.1e}",
+                                guard.current_freq, db_val, mag
+                            )
                         } else {
                             format!("{:.0} Hz", guard.current_freq)
-                        };
-                        let wide_text: Vec<u16> =
-                            text.encode_utf16().chain(std::iter::once(0)).collect();
-                        unsafe { SetTextColor(hdc, rgb(0, 0, 0)) };
-                        _ = unsafe {
-                            TextOutW(hdc, guard.mouse_x + 2, guard.mouse_y - 18, &wide_text)
-                        };
-                        unsafe { SetTextColor(hdc, rgb(255, 255, 255)) };
-                        _ = unsafe { TextOutW(hdc, guard.mouse_x, guard.mouse_y - 20, &wide_text) };
+                        }
+                    } else {
+                        String::new()
+                    };
 
-                        _ = unsafe { DeleteObject(HGDIOBJ(hfont.0)) };
-                    }
-                    _ = unsafe { EndPaint(hwnd, &ps) };
-                }
+                    // Copy image data into renderer's staging buffer
+                    ws.renderer.stage_image(&guard.image_data, ring_head);
+
+                    (db, mouse_in_client, text, guard.mouse_x, guard.mouse_y)
+                }; // mutex released here
+
+                let (db, mouse_in_client, text, mx, my) = snapshot;
+                ws.renderer
+                    .paint(db, mouse_in_client, &text, mx as f32, my as f32);
+
+                let _ = unsafe { ValidateRect(Some(hwnd), None) };
             }
 
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let state_ptr =
-                unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<AppState>;
-            if !state_ptr.is_null() {
-                let state = unsafe { &*state_ptr };
-                if let Ok(mut guard) = state.lock() {
+            let ws_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ws_ptr.is_null() {
+                let ws = unsafe { &mut *ws_ptr };
+                if let Ok(mut guard) = ws.state.lock() {
                     if guard.is_paused {
                         _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     }
@@ -285,18 +226,27 @@ unsafe extern "system" fn window_proc(
                         }
                     }
 
-                    if guard.resizing {
+                    let do_resize = if guard.resizing {
                         let mut current_pos = POINT::default();
                         unsafe { GetCursorPos(&mut current_pos).ok() };
                         let delta_x = current_pos.x - guard.resize_start.x;
                         let delta_y = current_pos.y - guard.resize_start.y;
                         guard.resize_start = current_pos;
 
-                        // Resize the window
                         let mut rect = RECT::default();
                         unsafe { GetWindowRect(hwnd, &mut rect).ok() };
                         let new_width = ((rect.right - rect.left) + delta_x).max(200);
                         let new_height = ((rect.bottom - rect.top) + delta_y).max(200);
+                        Some((new_width, new_height))
+                    } else {
+                        None
+                    };
+
+                    // Drop the lock before resize (SetWindowPos sends WM_SIZE synchronously)
+                    drop(guard);
+
+                    if let Some((new_width, new_height)) = do_resize {
+                        ws.renderer.resize(new_width as u32, new_height as u32);
                         unsafe {
                             SetWindowPos(
                                 hwnd,
@@ -315,11 +265,10 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            let state_ptr =
-                unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<AppState>;
-            if !state_ptr.is_null() {
-                let state = unsafe { &*state_ptr };
-                if let Ok(mut guard) = state.lock() {
+            let ws_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ws_ptr.is_null() {
+                let ws = unsafe { &*ws_ptr };
+                if let Ok(mut guard) = ws.state.lock() {
                     guard.dragging = true;
                     unsafe { GetCursorPos(&mut guard.drag_start).ok() };
                     unsafe { SetCapture(hwnd) };
@@ -328,11 +277,10 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let state_ptr =
-                unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<AppState>;
-            if !state_ptr.is_null() {
-                let state = unsafe { &*state_ptr };
-                if let Ok(mut guard) = state.lock() {
+            let ws_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ws_ptr.is_null() {
+                let ws = unsafe { &*ws_ptr };
+                if let Ok(mut guard) = ws.state.lock() {
                     guard.dragging = false;
                     unsafe { ReleaseCapture().unwrap() };
                 }
@@ -340,11 +288,10 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_RBUTTONDOWN => {
-            let state_ptr =
-                unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<AppState>;
-            if !state_ptr.is_null() {
-                let state = unsafe { &*state_ptr };
-                if let Ok(mut guard) = state.lock() {
+            let ws_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ws_ptr.is_null() {
+                let ws = unsafe { &*ws_ptr };
+                if let Ok(mut guard) = ws.state.lock() {
                     guard.resizing = true;
                     unsafe { GetCursorPos(&mut guard.resize_start).ok() };
                     unsafe { SetCapture(hwnd) };
@@ -353,11 +300,10 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            let state_ptr =
-                unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<AppState>;
-            if !state_ptr.is_null() {
-                let state = unsafe { &*state_ptr };
-                if let Ok(mut guard) = state.lock() {
+            let ws_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ws_ptr.is_null() {
+                let ws = unsafe { &*ws_ptr };
+                if let Ok(mut guard) = ws.state.lock() {
                     guard.resizing = false;
                     unsafe { ReleaseCapture().unwrap() };
                 }
@@ -370,22 +316,22 @@ unsafe extern "system" fn window_proc(
                     unsafe { PostQuitMessage(0) };
                 }
                 VK_SPACE => {
-                    let state_ptr =
-                        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<AppState>;
-                    if !state_ptr.is_null() {
-                        let state = unsafe { &*state_ptr };
-                        if let Ok(mut guard) = state.lock() {
+                    let ws_ptr =
+                        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+                    if !ws_ptr.is_null() {
+                        let ws = unsafe { &*ws_ptr };
+                        if let Ok(mut guard) = ws.state.lock() {
                             guard.is_paused = !guard.is_paused;
                         }
                     }
                     _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                 }
                 VK_T => {
-                    let state_ptr =
-                        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Mutex<AppState>;
-                    if !state_ptr.is_null() {
-                        let state = unsafe { &*state_ptr };
-                        if let Ok(mut guard) = state.lock() {
+                    let ws_ptr =
+                        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+                    if !ws_ptr.is_null() {
+                        let ws = unsafe { &*ws_ptr };
+                        if let Ok(mut guard) = ws.state.lock() {
                             guard.is_always_on_top = !guard.is_always_on_top;
                             let hwnd_insert_after = if guard.is_always_on_top {
                                 HWND_TOPMOST
@@ -408,6 +354,18 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            let width = (lparam.0 & 0xFFFF) as u32;
+            let height = ((lparam.0 >> 16) & 0xFFFF) as u32;
+            if width > 0 && height > 0 {
+                let ws_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+                if !ws_ptr.is_null() {
+                    let ws = unsafe { &mut *ws_ptr };
+                    ws.renderer.resize(width, height);
+                }
             }
             LRESULT(0)
         }
@@ -461,7 +419,7 @@ fn audio_thread_loop(hwnd: usize, state: &Arc<Mutex<AppState>>) -> ResultAny {
             let packet_frames = capture.GetNextPacketSize()?;
 
             if packet_frames == 0 {
-                Sleep(0);
+                Sleep(1);
                 continue;
             }
 
@@ -495,7 +453,7 @@ fn audio_thread_loop(hwnd: usize, state: &Arc<Mutex<AppState>>) -> ResultAny {
                 // If buffer is full, process STFT and shift for overlap
                 if buffer_head >= buffer.len() && !state.lock().unwrap().is_paused {
                     let mag_column = process(&buffer, &hann_window, &fft);
-                    let rgb_column: Vec<u8> = mag_column
+                    let rgba_column: Vec<u8> = mag_column
                         .iter()
                         .flat_map(|&mag| sample_to_color(mag))
                         .collect();
@@ -503,24 +461,15 @@ fn audio_thread_loop(hwnd: usize, state: &Arc<Mutex<AppState>>) -> ResultAny {
                     buffer.copy_within(HOP_SIZE.., 0);
                     buffer_head = FFT_SIZE - HOP_SIZE;
 
-                    // Add new row to the image, scroll old rows down
+                    // Write new row into ring buffer (no shifting needed)
                     const W: usize = FFT_SIZE / 2;
-                    const H: usize = TIME_FRAMES;
                     {
                         let mut guard = state.lock().unwrap();
-                        for i in (1..H).rev() {
-                            let src_start = (i - 1) * W;
-                            let dst_start = i * W;
-                            guard
-                                .image_data
-                                .copy_within(src_start * 3..(src_start + W) * 3, dst_start * 3);
-                            guard
-                                .magnitudes
-                                .copy_within(src_start..src_start + W, dst_start);
-                        }
-                        // Add new row at the top
-                        guard.image_data[0..W * 3].copy_from_slice(&rgb_column);
-                        guard.magnitudes[0..W].copy_from_slice(&mag_column);
+                        guard.ring_head = (guard.ring_head + TIME_FRAMES - 1) % TIME_FRAMES;
+                        let row = guard.ring_head;
+                        guard.image_data[row * W * 4..(row + 1) * W * 4]
+                            .copy_from_slice(&rgba_column);
+                        guard.magnitudes[row * W..(row + 1) * W].copy_from_slice(&mag_column);
                     }
 
                     InvalidateRect(Some(hwnd), None, false).unwrap();
@@ -535,6 +484,7 @@ fn audio_thread_loop(hwnd: usize, state: &Arc<Mutex<AppState>>) -> ResultAny {
 struct AppState {
     image_data: Vec<u8>,
     magnitudes: Vec<f32>,
+    ring_head: usize,
     sample_rate: u32,
     dragging: bool,
     drag_start: POINT,
@@ -545,17 +495,25 @@ struct AppState {
     mouse_y: i32,
     current_freq: f32,
     is_paused: bool,
-    // renderer: Arc<Mutex<Renderer>>,
+}
+
+/// Stored in GWLP_USERDATA. Renderer is only accessed from the UI thread
+/// so it doesn't need the mutex. Shared audio state is behind the Mutex.
+struct WindowState {
+    state: Arc<Mutex<AppState>>,
+    renderer: D2DRenderer,
 }
 
 fn run_app() -> ResultAny {
     unsafe {
         let window = Window::new(1024, 768, Some(window_proc))?;
-        // let renderer = Renderer::new(window.hwnd(), window.width() as u32, window.height() as u32)?;
+
+        let d2d_renderer = D2DRenderer::new(window.hwnd(), FFT_SIZE, TIME_FRAMES)?;
 
         let state = Arc::new(Mutex::new(AppState {
-            image_data: vec![0u8; (FFT_SIZE / 2) * TIME_FRAMES * 3],
+            image_data: vec![0u8; (FFT_SIZE / 2) * TIME_FRAMES * 4],
             magnitudes: vec![0.0; (FFT_SIZE / 2) * TIME_FRAMES],
+            ring_head: 0,
             sample_rate: 48000,
             dragging: false,
             drag_start: POINT::default(),
@@ -566,10 +524,13 @@ fn run_app() -> ResultAny {
             mouse_y: 0,
             current_freq: 0.0,
             is_paused: false,
-            // renderer: Arc::new(Mutex::new(renderer)),
         }));
 
-        window.set_user_data(Arc::into_raw(state.clone()) as isize);
+        let ws = Box::new(WindowState {
+            state: state.clone(),
+            renderer: d2d_renderer,
+        });
+        window.set_user_data(Box::into_raw(ws) as isize);
 
         let sendable_hwnd = window.hwnd().0 as usize;
         std::thread::spawn(move || {

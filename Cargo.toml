@@ -6,14 +6,18 @@ edition = "2024"
 [dependencies]
 color-eyre = "0.6.5"
 rustfft = "6.4.1"
+windows-numerics = "0.3.1"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     # "Win32_Graphics_Direct3D",
     # "Win32_Graphics_Direct3D_Fxc",
     # "Win32_Graphics_Direct3D12",
     # "Win32_Graphics_Dxgi",
-    # "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_UI",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input",

@@ -78,6 +78,7 @@ dependencies = [
  "color-eyre",
  "rustfft",
  "windows",
+ "windows-numerics",
 ]
 
 [[package]]
