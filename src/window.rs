@@ -63,6 +63,10 @@ impl Window {
         }
     }
 
+    pub fn user_data(&self) -> isize {
+        unsafe { GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) }
+    }
+
     pub fn width(&self) -> i32 {
         let mut rect = RECT::default();
         unsafe { GetWindowRect(self.hwnd, &mut rect) }.unwrap();
@@ -107,8 +111,6 @@ impl Window {
 
     pub fn handle_events(&self) -> bool {
         let mut msg = MSG::default();
-        // Block until a message arrives, avoiding busy-spin
-        unsafe { WaitMessage().ok() };
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() } {
             if msg.message == WM_QUIT {
                 return false;

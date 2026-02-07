@@ -4,13 +4,15 @@ pub use color_eyre::eyre::eyre;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 use std::{
     f32::consts::PI,
-    ffi::c_void,
     ptr::null_mut,
     sync::{Arc, Mutex},
 };
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-    Graphics::Gdi::{InvalidateRect, ScreenToClient, ValidateRect},
+    Graphics::{
+        Dwm::DwmFlush,
+        Gdi::{InvalidateRect, ScreenToClient, ValidateRect},
+    },
     Media::Audio::{
         AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient,
         IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
@@ -187,9 +189,6 @@ unsafe extern "system" fn window_proc(
             if !ws_ptr.is_null() {
                 let ws = unsafe { &mut *ws_ptr };
                 if let Ok(mut guard) = ws.state.lock() {
-                    if guard.is_paused {
-                        _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
-                    }
                     let x = (lparam.0 & 0xFFFF) as i32;
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                     guard.mouse_x = x;
@@ -324,7 +323,6 @@ unsafe extern "system" fn window_proc(
                             guard.is_paused = !guard.is_paused;
                         }
                     }
-                    _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                 }
                 VK_T => {
                     let ws_ptr =
@@ -377,8 +375,7 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn audio_thread_loop(hwnd: usize, state: &Arc<Mutex<AppState>>) -> ResultAny {
-    let hwnd = HWND(hwnd as *mut c_void);
+fn audio_thread_loop(state: &Arc<Mutex<AppState>>) -> ResultAny {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
 
@@ -471,8 +468,6 @@ fn audio_thread_loop(hwnd: usize, state: &Arc<Mutex<AppState>>) -> ResultAny {
                             .copy_from_slice(&rgba_column);
                         guard.magnitudes[row * W..(row + 1) * W].copy_from_slice(&mag_column);
                     }
-
-                    InvalidateRect(Some(hwnd), None, false).unwrap();
                 }
             }
 
@@ -532,14 +527,16 @@ fn run_app() -> ResultAny {
         });
         window.set_user_data(Box::into_raw(ws) as isize);
 
-        let sendable_hwnd = window.hwnd().0 as usize;
         std::thread::spawn(move || {
-            if let Err(e) = audio_thread_loop(sendable_hwnd, &state) {
+            if let Err(e) = audio_thread_loop(&state) {
                 eprintln!("Audio Error: {:?}", e);
             }
         });
 
-        while window.handle_events() {}
+        while window.handle_events() {
+            let _ = InvalidateRect(Some(window.hwnd()), None, false);
+            let _ = DwmFlush();
+        }
 
         CoUninitialize();
     }
