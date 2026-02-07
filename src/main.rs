@@ -34,16 +34,45 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
 }
 
-const FFT_SIZE: usize = 2048;
+const FFT_SIZE: usize = 4096;
 const HOP_SIZE: usize = FFT_SIZE / 4;
-const TIME_FRAMES: usize = 768;
+const TIME_FRAMES: usize = 512;
+const MAX_HZ: f32 = 20000.0;
+
+/// Number of FFT bins to display, clamped to MAX_HZ.
+fn display_bins(sample_rate: u32) -> usize {
+    let bins = (MAX_HZ * FFT_SIZE as f32 / sample_rate as f32).ceil() as usize;
+    bins.min(FFT_SIZE / 2)
+}
+
+fn cola_normalization(window: &[f32], hop_size: usize) -> Vec<f32> {
+    let n = window.len();
+    let mut norm = vec![0.0f32; n];
+    let num_overlaps = (n + hop_size - 1) / hop_size;
+    for k in 0..num_overlaps {
+        let offset = k * hop_size;
+        for i in 0..n {
+            let j = (i + offset) % n;
+            norm[i] += window[j] * window[j];
+        }
+    }
+
+    norm
+}
+
+/// For windows that satisfy COLA (like Hann with hop = N/4),
+/// the normalization is a constant. This returns that scalar.
+fn cola_normalization_scalar(window: &[f32], hop_size: usize) -> f32 {
+    let norm = cola_normalization(window, hop_size);
+    norm.iter().sum::<f32>() / norm.len() as f32
+}
 
 fn sample_to_color(magnitude: f32) -> [u8; 3] {
-    let magnitude = magnitude * 2.0 / FFT_SIZE as f32;
+    let magnitude = magnitude / FFT_SIZE as f32;
     let log_val = 20.0 * (magnitude + 1e-10).log10();
 
-    let vmin = -90.0;
-    let vmax = -20.0;
+    let vmin = -100.0;
+    let vmax = -30.0;
     let x = ((log_val - vmin) / (vmax - vmin)).clamp(0.0, 1.0);
 
     let r = 1.0 * x + 2.0 * x * x - 2.0 * x * x * x;
@@ -116,10 +145,11 @@ unsafe extern "system" fn window_proc(
                     if mouse_in_client {
                         guard.mouse_x = client_cursor.x;
                         guard.mouse_y = client_cursor.y;
-                        let freq = (client_cursor.x as f32 / width as f32)
-                            * (guard.sample_rate as f32 / 2.0);
+                        let freq = (client_cursor.x as f32 / width as f32) * MAX_HZ;
                         guard.current_freq = freq;
                     }
+
+                    let db = display_bins(guard.sample_rate);
 
                     let bmi = BITMAPINFO {
                         bmiHeader: BITMAPINFOHEADER {
@@ -145,7 +175,7 @@ unsafe extern "system" fn window_proc(
                             height,
                             0,
                             0,
-                            FFT_SIZE as i32 / 2,
+                            db as i32,
                             TIME_FRAMES as i32,
                             Some(guard.image_data.as_ptr() as *const _),
                             &bmi,
@@ -177,12 +207,11 @@ unsafe extern "system" fn window_proc(
                         };
                         unsafe { SelectObject(hdc, HGDIOBJ(hfont.0)) };
 
-                        let bitmap_x = ((guard.mouse_x as f32 / width as f32)
-                            * (FFT_SIZE as f32 / 2.0))
-                            .floor() as usize;
+                        let bitmap_x =
+                            ((guard.mouse_x as f32 / width as f32) * db as f32).floor() as usize;
                         let bitmap_y = ((guard.mouse_y as f32 / height as f32) * TIME_FRAMES as f32)
                             .floor() as usize;
-                        let mag = if bitmap_x < FFT_SIZE / 2 && bitmap_y < TIME_FRAMES {
+                        let mag = if bitmap_x < db && bitmap_y < TIME_FRAMES {
                             guard.magnitudes[bitmap_y * (FFT_SIZE / 2) + bitmap_x]
                         } else {
                             0.0
@@ -217,6 +246,9 @@ unsafe extern "system" fn window_proc(
             if !state_ptr.is_null() {
                 let state = unsafe { &*state_ptr };
                 if let Ok(mut guard) = state.lock() {
+                    if guard.is_paused {
+                        _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    }
                     let x = (lparam.0 & 0xFFFF) as i32;
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                     guard.mouse_x = x;
@@ -226,8 +258,7 @@ unsafe extern "system" fn window_proc(
                     unsafe { GetClientRect(hwnd, &mut client_rect).ok() };
                     let client_width = client_rect.right - client_rect.left;
                     if client_width > 0 {
-                        let freq =
-                            (x as f32 / client_width as f32) * (guard.sample_rate as f32 / 2.0);
+                        let freq = (x as f32 / client_width as f32) * MAX_HZ;
                         guard.current_freq = freq;
                     }
                     if guard.dragging {
@@ -406,9 +437,11 @@ fn audio_thread_loop(hwnd: usize, state: &Arc<Mutex<AppState>>) -> ResultAny {
 
         let mut buffer = vec![0f32; FFT_SIZE];
         let mut buffer_head = 0;
-        let hann_window: Vec<f32> = (0..FFT_SIZE)
+        let mut hann_window: Vec<f32> = (0..FFT_SIZE)
             .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / FFT_SIZE as f32).cos()))
             .collect();
+        let window_norm = cola_normalization_scalar(&hann_window, HOP_SIZE).sqrt();
+        hann_window.iter_mut().for_each(|w| *w /= window_norm);
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(buffer.len());
 
