@@ -56,8 +56,8 @@ impl D2DRenderer {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     alphaMode: D2D1_ALPHA_MODE_IGNORE,
                 },
-                dpiX: 0.0,
-                dpiY: 0.0,
+                dpiX: 96.0,
+                dpiY: 96.0,
             };
             let bmp_size = D2D_SIZE_U {
                 width: (fft_size / 2) as u32,

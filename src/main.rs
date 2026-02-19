@@ -11,7 +11,7 @@ use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::{
         Dwm::DwmFlush,
-        Gdi::{InvalidateRect, ScreenToClient, ValidateRect},
+        Gdi::{InvalidateRect, ValidateRect},
     },
     Media::Audio::{
         AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient,
@@ -29,10 +29,10 @@ use window::Window;
 
 pub type ResultAny<T = ()> = color_eyre::Result<T>;
 
-const FFT_SIZE: usize = 4096;
+const FFT_SIZE: usize = 8192;
 const HOP_SIZE: usize = FFT_SIZE / 4;
 const TIME_FRAMES: usize = 256;
-const MAX_HZ: f32 = 15000.0;
+const MAX_HZ: f32 = 5000.0;
 
 /// Number of FFT bins to display, clamped to MAX_HZ.
 fn display_bins(sample_rate: u32) -> usize {
@@ -69,6 +69,7 @@ fn sample_to_color(magnitude: f32) -> [u8; 4] {
     let vmin = -100.0;
     let vmax = -30.0;
     let x = ((log_val - vmin) / (vmax - vmin)).clamp(0.0, 1.0);
+    let x = x * x;
 
     let r = 1.0 * x + 2.0 * x * x - 2.0 * x * x * x;
     let g = 0.2 * x + 0.1 * x * x + 0.7 * x * x * x;
@@ -120,38 +121,34 @@ unsafe extern "system" fn window_proc(
 
                 // Snapshot shared state under the lock, then drop it before rendering.
                 let snapshot = {
-                    let mut guard = ws.state.lock().unwrap();
-                    let mut client_rect = RECT::default();
-                    unsafe { GetClientRect(hwnd, &mut client_rect).ok() };
-                    let width = client_rect.right - client_rect.left;
-                    let height = client_rect.bottom - client_rect.top;
+                    let guard = ws.state.lock().unwrap();
+                    let mut window_rect = RECT::default();
+                    unsafe { GetWindowRect(hwnd, &mut window_rect).ok() };
+                    let width = window_rect.right - window_rect.left;
+                    let height = window_rect.bottom - window_rect.top;
 
-                    let mut cursor_pos = POINT::default();
-                    unsafe { GetCursorPos(&mut cursor_pos).ok() };
-                    let mut client_cursor = cursor_pos;
-                    _ = unsafe { ScreenToClient(hwnd, &mut client_cursor).ok() };
-                    let mouse_in_client = client_cursor.x >= 0
-                        && client_cursor.x < width
-                        && client_cursor.y >= 0
-                        && client_cursor.y < height;
+                    let mut screen_cursor = POINT::default();
+                    unsafe { GetPhysicalCursorPos(&mut screen_cursor).ok() };
+                    let mut window_rect = RECT::default();
+                    unsafe { GetWindowRect(hwnd, &mut window_rect).ok() };
+                    let mut cursor = POINT::default();
+                    cursor.x = screen_cursor.x - window_rect.left;
+                    cursor.y = screen_cursor.y - window_rect.top;
 
-                    if mouse_in_client {
-                        guard.mouse_x = client_cursor.x;
-                        guard.mouse_y = client_cursor.y;
-                        let freq = (client_cursor.x as f32 / width as f32) * MAX_HZ;
-                        guard.current_freq = freq;
-                    }
+                    let mouse_in_client =
+                        cursor.x >= 0 && cursor.x < width && cursor.y >= 0 && cursor.y < height;
 
-                    let db = display_bins(guard.sample_rate);
+                    let display_bins = display_bins(guard.sample_rate);
                     let ring_head = guard.ring_head;
 
                     let text = if mouse_in_client {
-                        let bitmap_x =
-                            ((guard.mouse_x as f32 / width as f32) * db as f32).floor() as usize;
+                        let bitmap_x = ((guard.mouse_x as f32 / width as f32) * display_bins as f32)
+                            .floor() as usize;
+
                         let visual_y = ((guard.mouse_y as f32 / height as f32) * TIME_FRAMES as f32)
                             .floor() as usize;
                         let buffer_y = (ring_head + visual_y) % TIME_FRAMES;
-                        let mag = if bitmap_x < db && visual_y < TIME_FRAMES {
+                        let mag = if bitmap_x < display_bins && visual_y < TIME_FRAMES {
                             guard.magnitudes[buffer_y * (FFT_SIZE / 2) + bitmap_x]
                         } else {
                             0.0
@@ -172,7 +169,13 @@ unsafe extern "system" fn window_proc(
                     // Copy image data into renderer's staging buffer
                     ws.renderer.stage_image(&guard.image_data, ring_head);
 
-                    (db, mouse_in_client, text, guard.mouse_x, guard.mouse_y)
+                    (
+                        display_bins,
+                        mouse_in_client,
+                        text,
+                        guard.mouse_x,
+                        guard.mouse_y,
+                    )
                 }; // mutex released here
 
                 let (db, mouse_in_client, text, mx, my) = snapshot;
@@ -189,34 +192,34 @@ unsafe extern "system" fn window_proc(
             if !ws_ptr.is_null() {
                 let ws = unsafe { &mut *ws_ptr };
                 if let Ok(mut guard) = ws.state.lock() {
-                    let x = (lparam.0 & 0xFFFF) as i32;
-                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                    guard.mouse_x = x;
-                    guard.mouse_y = y;
+                    let mut screen_cursor = POINT::default();
+                    unsafe { GetPhysicalCursorPos(&mut screen_cursor).ok() };
+                    let mut window_rect = RECT::default();
+                    unsafe { GetWindowRect(hwnd, &mut window_rect).ok() };
+                    let mut cursor = POINT::default();
+                    cursor.x = screen_cursor.x - window_rect.left;
+                    cursor.y = screen_cursor.y - window_rect.top;
+                    guard.mouse_x = cursor.x;
+                    guard.mouse_y = cursor.y;
 
-                    let mut client_rect = RECT::default();
-                    unsafe { GetClientRect(hwnd, &mut client_rect).ok() };
-                    let client_width = client_rect.right - client_rect.left;
-                    if client_width > 0 {
-                        let freq = (x as f32 / client_width as f32) * MAX_HZ;
+                    let width = window_rect.right - window_rect.left;
+                    let height = window_rect.bottom - window_rect.top;
+                    if width > 0 {
+                        let freq = (guard.mouse_x as f32 / width as f32) * MAX_HZ;
                         guard.current_freq = freq;
                     }
                     if guard.dragging {
-                        let mut current_pos = POINT::default();
-                        unsafe { GetCursorPos(&mut current_pos).ok() };
-                        let delta_x = current_pos.x - guard.drag_start.x;
-                        let delta_y = current_pos.y - guard.drag_start.y;
-                        guard.drag_start = current_pos;
+                        let delta_x = screen_cursor.x - guard.drag_start.x;
+                        let delta_y = screen_cursor.y - guard.drag_start.y;
+                        guard.drag_start = screen_cursor;
 
                         // Move the window
-                        let mut rect = RECT::default();
-                        unsafe { GetWindowRect(hwnd, &mut rect).ok() };
                         unsafe {
                             SetWindowPos(
                                 hwnd,
                                 None,
-                                rect.left + delta_x,
-                                rect.top + delta_y,
+                                window_rect.left + delta_x,
+                                window_rect.top + delta_y,
                                 0,
                                 0,
                                 SWP_NOSIZE | SWP_NOZORDER,
@@ -226,16 +229,12 @@ unsafe extern "system" fn window_proc(
                     }
 
                     let do_resize = if guard.resizing {
-                        let mut current_pos = POINT::default();
-                        unsafe { GetCursorPos(&mut current_pos).ok() };
-                        let delta_x = current_pos.x - guard.resize_start.x;
-                        let delta_y = current_pos.y - guard.resize_start.y;
-                        guard.resize_start = current_pos;
+                        let delta_x = screen_cursor.x - guard.resize_start.x;
+                        let delta_y = screen_cursor.y - guard.resize_start.y;
+                        guard.resize_start = screen_cursor;
 
-                        let mut rect = RECT::default();
-                        unsafe { GetWindowRect(hwnd, &mut rect).ok() };
-                        let new_width = ((rect.right - rect.left) + delta_x).max(200);
-                        let new_height = ((rect.bottom - rect.top) + delta_y).max(200);
+                        let new_width = (width + delta_x).max(200);
+                        let new_height = (height + delta_y).max(200);
                         Some((new_width, new_height))
                     } else {
                         None
@@ -269,7 +268,7 @@ unsafe extern "system" fn window_proc(
                 let ws = unsafe { &*ws_ptr };
                 if let Ok(mut guard) = ws.state.lock() {
                     guard.dragging = true;
-                    unsafe { GetCursorPos(&mut guard.drag_start).ok() };
+                    unsafe { GetPhysicalCursorPos(&mut guard.drag_start).ok() };
                     unsafe { SetCapture(hwnd) };
                 }
             }
@@ -292,7 +291,7 @@ unsafe extern "system" fn window_proc(
                 let ws = unsafe { &*ws_ptr };
                 if let Ok(mut guard) = ws.state.lock() {
                     guard.resizing = true;
-                    unsafe { GetCursorPos(&mut guard.resize_start).ok() };
+                    unsafe { GetPhysicalCursorPos(&mut guard.resize_start).ok() };
                     unsafe { SetCapture(hwnd) };
                 }
             }
@@ -544,8 +543,12 @@ fn run_app() -> ResultAny {
     Ok(())
 }
 
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
+
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
-    _ = unsafe { SetProcessDPIAware() };
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).ok() };
     Ok(run_app()?)
 }
