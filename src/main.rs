@@ -11,7 +11,7 @@ use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::{
         Dwm::DwmFlush,
-        Gdi::{InvalidateRect, ValidateRect},
+        Gdi::{InvalidateRect, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, ValidateRect},
     },
     Media::Audio::{
         AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient,
@@ -256,6 +256,12 @@ unsafe extern "system" fn window_proc(
                                 SWP_NOMOVE | SWP_NOZORDER,
                             )
                             .ok();
+                            _ = RedrawWindow(
+                                Some(hwnd),
+                                None,
+                                None,
+                                RDW_INVALIDATE | RDW_UPDATENOW,
+                            );
                         }
                     }
                 }
