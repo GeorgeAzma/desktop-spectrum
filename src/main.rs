@@ -95,6 +95,18 @@ fn stft(buffer: &[f32], window: &[f32], fft: &Arc<dyn Fft<f32>>) -> Vec<Complex<
     return windowed;
 }
 
+fn hz_to_note(freq: f32) -> String {
+    let n = (12.0 * (freq.max(1.0) / 440.0).log2() + 69.0).max(0.0);
+    let n_int = n.round() as i32;
+
+    let note_name = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ][(n_int % 12) as usize];
+    let octave = n_int / 12 - 1;
+
+    format!("{note_name}{octave}")
+}
+
 /// Returns: new magnitude column
 fn process(buffer: &[f32], window: &[f32], fft: &Arc<dyn Fft<f32>>) -> Vec<f32> {
     assert_eq!(buffer.len(), FFT_SIZE);
@@ -156,11 +168,18 @@ unsafe extern "system" fn window_proc(
                         let db_val = 20.0 * (mag * 2.0 / FFT_SIZE as f32 + 1e-10).log10();
                         if guard.is_paused {
                             format!(
-                                "{:.0} Hz, {:.1} dB, {:.1e}",
-                                guard.current_freq, db_val, mag
+                                "{:.0} Hz • {}\n{:.1} dB, {:.1e}",
+                                guard.current_freq,
+                                hz_to_note(guard.current_freq),
+                                db_val,
+                                mag
                             )
                         } else {
-                            format!("{:.0} Hz", guard.current_freq)
+                            format!(
+                                "{:.0} Hz • {}",
+                                guard.current_freq,
+                                hz_to_note(guard.current_freq)
+                            )
                         }
                     } else {
                         String::new()
