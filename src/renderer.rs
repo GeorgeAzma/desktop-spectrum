@@ -109,11 +109,12 @@ impl D2DRenderer {
         }
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
+    pub fn resize(&mut self, width: u32, height: u32) -> ResultAny {
         let size = D2D_SIZE_U { width, height };
         unsafe {
-            let _ = self.render_target.Resize(&size);
+            self.render_target.Resize(&size)?;
         }
+        Ok(())
     }
 
     /// Copy ring buffer into linear staging buffer (call while holding lock).
@@ -133,7 +134,14 @@ impl D2DRenderer {
     }
 
     /// Render from staging buffer (call WITHOUT holding lock).
-    pub fn paint(&self, db: usize, mouse_in_client: bool, text: &str, mouse_x: f32, mouse_y: f32) {
+    pub fn paint(
+        &self,
+        db: usize,
+        mouse_in_client: bool,
+        text: &str,
+        mouse_x: f32,
+        mouse_y: f32,
+    ) -> ResultAny {
         unsafe {
             let w = self.fft_size / 2;
             let pitch = w as u32 * 4;
@@ -144,11 +152,11 @@ impl D2DRenderer {
                 right: w as u32,
                 bottom: self.time_frames as u32,
             };
-            let _ = self.bitmap.CopyFromMemory(
+            self.bitmap.CopyFromMemory(
                 Some(&rect),
                 self.staging.as_ptr() as *const c_void,
                 pitch,
-            );
+            )?;
 
             self.render_target.BeginDraw();
 
@@ -213,8 +221,9 @@ impl D2DRenderer {
                 }
             }
 
-            let _ = self.render_target.EndDraw(None, None);
+            self.render_target.EndDraw(None, None)?;
         }
+        Ok(())
     }
 }
 

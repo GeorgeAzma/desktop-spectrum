@@ -4,7 +4,9 @@ use windows::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::*,
         System::LibraryLoader::*,
-        UI::WindowsAndMessaging::*,
+        UI::WindowsAndMessaging::{
+            MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, QS_ALLINPUT, *,
+        },
     },
     core::*,
 };
@@ -121,6 +123,13 @@ impl Window {
             }
         }
         true
+    }
+
+    pub fn wait_for_events(&self, timeout: std::time::Duration) {
+        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+        unsafe {
+            let _ = MsgWaitForMultipleObjectsEx(None, timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
     }
 
     pub fn hwnd(&self) -> HWND {

@@ -4,18 +4,21 @@ pub use color_eyre::eyre::eyre;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 use std::{
     f32::consts::PI,
-    ptr::null_mut,
+    ffi::c_void,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-    Graphics::{
-        Dwm::DwmFlush,
-        Gdi::{InvalidateRect, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, ValidateRect},
-    },
+    Graphics::Gdi::{InvalidateRect, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, ValidateRect},
     Media::Audio::{
-        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient, IAudioClient,
-        IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
+        AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+        IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+        WAVEFORMATEXTENSIBLE, eConsole, eRender,
+    },
+    Media::{
+        KernelStreaming::WAVE_FORMAT_EXTENSIBLE,
+        Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
     },
     System::{Com::*, Threading::Sleep},
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
@@ -33,6 +36,8 @@ const FFT_SIZE: usize = 8192;
 const HOP_SIZE: usize = FFT_SIZE / 4;
 const TIME_FRAMES: usize = 256;
 const MAX_HZ: f32 = 5000.0;
+const UI_FPS: u32 = 360;
+const WM_FFT_READY: u32 = WM_APP + 1;
 
 /// Number of FFT bins to display, clamped to MAX_HZ.
 fn display_bins(sample_rate: u32) -> usize {
@@ -126,6 +131,13 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match msg {
         WM_ERASEBKGND => return LRESULT(1),
+        WM_FFT_READY => {
+            // The audio thread posts this only after publishing a complete
+            // FFT column. This keeps spectrum repaints synchronized to the
+            // sample-rate / hop-size cadence instead of polling for them.
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            LRESULT(0)
+        }
         WM_PAINT => {
             let ws_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if !ws_ptr.is_null() {
@@ -185,8 +197,12 @@ unsafe extern "system" fn window_proc(
                         String::new()
                     };
 
-                    // Copy image data into renderer's staging buffer
-                    ws.renderer.stage_image(&guard.image_data, ring_head);
+                    // Copy image data only when a new FFT column exists. UI-only
+                    // repaints reuse the already uploaded bitmap.
+                    if guard.image_generation != ws.last_image_generation {
+                        ws.renderer.stage_image(&guard.image_data, ring_head);
+                        ws.last_image_generation = guard.image_generation;
+                    }
 
                     (
                         display_bins,
@@ -198,8 +214,12 @@ unsafe extern "system" fn window_proc(
                 }; // mutex released here
 
                 let (db, mouse_in_client, text, mx, my) = snapshot;
-                ws.renderer
-                    .paint(db, mouse_in_client, &text, mx as f32, my as f32);
+                if let Err(error) =
+                    ws.renderer
+                        .paint(db, mouse_in_client, &text, mx as f32, my as f32)
+                {
+                    eprintln!("Render error: {error:?}");
+                }
 
                 let _ = unsafe { ValidateRect(Some(hwnd), None) };
             }
@@ -263,7 +283,10 @@ unsafe extern "system" fn window_proc(
                     drop(guard);
 
                     if let Some((new_width, new_height)) = do_resize {
-                        ws.renderer.resize(new_width as u32, new_height as u32);
+                        if let Err(error) = ws.renderer.resize(new_width as u32, new_height as u32)
+                        {
+                            eprintln!("Resize error: {error:?}");
+                        }
                         unsafe {
                             SetWindowPos(
                                 hwnd,
@@ -386,7 +409,9 @@ unsafe extern "system" fn window_proc(
                 let ws_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
                 if !ws_ptr.is_null() {
                     let ws = unsafe { &mut *ws_ptr };
-                    ws.renderer.resize(width, height);
+                    if let Err(error) = ws.renderer.resize(width, height) {
+                        eprintln!("Resize error: {error:?}");
+                    }
                 }
             }
             LRESULT(0)
@@ -403,18 +428,61 @@ fn audio_thread_loop(state: &Arc<Mutex<AppState>>) -> ResultAny {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
 
+        // A WASAPI client can become invalid when the default device changes or
+        // the audio service restarts. Recreate the whole client instead of
+        // allowing one transient error to permanently kill the worker thread.
+        loop {
+            if let Err(error) = audio_capture_session(state) {
+                eprintln!("Audio session stopped: {error:?}; retrying");
+                Sleep(250);
+            }
+        }
+    }
+}
+
+fn audio_capture_session(state: &Arc<Mutex<AppState>>) -> ResultAny {
+    unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
-
         let audio_client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
 
         let format = audio_client.GetMixFormat()?;
-        let channels = (*format).nChannels;
+        let channels = (*format).nChannels as usize;
         let sample_rate = (*format).nSamplesPerSec;
+        let is_float32 = if (*format).wFormatTag == WAVE_FORMAT_IEEE_FLOAT as u16 {
+            (*format).wBitsPerSample == 32
+                && (*format).nBlockAlign == (channels * std::mem::size_of::<f32>()) as u16
+        } else if (*format).wFormatTag == WAVE_FORMAT_EXTENSIBLE as u16 && (*format).cbSize >= 22 {
+            let extensible = format as *const WAVEFORMATEXTENSIBLE;
+            std::ptr::read_unaligned(std::ptr::addr_of!((*extensible).SubFormat))
+                == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+                && (*format).wBitsPerSample == 32
+                && (*format).nBlockAlign == (channels * std::mem::size_of::<f32>()) as u16
+        } else {
+            false
+        };
+        if channels == 0 || !is_float32 {
+            CoTaskMemFree(Some(format as *const c_void));
+            return Err(eyre!("audio device format is not interleaved 32-bit float"));
+        }
+
+        // GetMixFormat returns an allocated WAVEFORMATEX. Initialize copies it,
+        // so release it immediately after Initialize, including on failure.
+        let initialize_result = audio_client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
+            0,
+            0,
+            format,
+            None,
+        );
+        CoTaskMemFree(Some(format as *const c_void));
+        initialize_result?;
+
         state.lock().unwrap().sample_rate = sample_rate;
 
-        let mut buffer = vec![0f32; FFT_SIZE];
+        let mut buffer = vec![0.0f32; FFT_SIZE];
         let mut buffer_head = 0;
         let mut hann_window: Vec<f32> = (0..FFT_SIZE)
             .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / FFT_SIZE as f32).cos()))
@@ -424,85 +492,87 @@ fn audio_thread_loop(state: &Arc<Mutex<AppState>>) -> ResultAny {
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(buffer.len());
 
-        audio_client.Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK,
-            0,
-            0,
-            format,
-            None,
-        )?;
-
         let capture: IAudioCaptureClient = audio_client.GetService()?;
         audio_client.Start()?;
 
         loop {
             let packet_frames = capture.GetNextPacketSize()?;
-
             if packet_frames == 0 {
                 Sleep(1);
                 continue;
             }
 
-            let mut data_ptr = null_mut();
+            let mut data_ptr = std::ptr::null_mut();
             let mut frames = 0;
             let mut flags = 0;
-
             capture.GetBuffer(&mut data_ptr, &mut frames, &mut flags, None, None)?;
 
-            let raw_samples = std::slice::from_raw_parts(
-                data_ptr as *const f32,
-                frames as usize * channels as usize,
-            );
-            let samples: Vec<f32> = raw_samples
-                .chunks_exact(channels as usize)
-                .map(|chunk| {
-                    let sum: f32 = chunk.iter().map(|&s| s).sum();
-                    sum / chunk.len() as f32
-                })
-                .collect();
+            // Copy the packet and release WASAPI's buffer before doing any FFT
+            // or mutex work. This prevents capture-buffer overruns.
+            let samples: Vec<f32> = if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                vec![0.0; frames as usize * channels]
+            } else {
+                if data_ptr.is_null() {
+                    capture.ReleaseBuffer(frames)?;
+                    return Err(eyre!("WASAPI returned a null audio buffer"));
+                }
+                let raw_samples =
+                    std::slice::from_raw_parts(data_ptr as *const f32, frames as usize * channels);
+                raw_samples
+                    .chunks_exact(channels)
+                    .map(|chunk| chunk.iter().copied().sum::<f32>() / channels as f32)
+                    .collect()
+            };
+            capture.ReleaseBuffer(frames)?;
 
             let mut sample_idx = 0;
             while sample_idx < samples.len() {
+                // Pausing freezes the displayed spectrum and discards incoming
+                // samples. Resetting the partial frame also prevents the
+                // full-buffer/zero-space infinite loop.
+                if state.lock().unwrap().is_paused {
+                    buffer_head = 0;
+                    break;
+                }
+
+                if buffer_head == buffer.len() {
+                    let mag_column = process(&buffer, &hann_window, &fft);
+                    let rgba_column: Vec<u8> = mag_column
+                        .iter()
+                        .flat_map(|&mag| sample_to_color(mag))
+                        .collect();
+
+                    buffer.copy_within(HOP_SIZE.., 0);
+                    buffer_head = FFT_SIZE - HOP_SIZE;
+
+                    const W: usize = FFT_SIZE / 2;
+                    let mut guard = state.lock().unwrap();
+                    guard.ring_head = (guard.ring_head + TIME_FRAMES - 1) % TIME_FRAMES;
+                    let row = guard.ring_head;
+                    guard.image_data[row * W * 4..(row + 1) * W * 4].copy_from_slice(&rgba_column);
+                    guard.magnitudes[row * W..(row + 1) * W].copy_from_slice(&mag_column);
+                    guard.image_generation = guard.image_generation.wrapping_add(1);
+                    let hwnd = HWND(guard.hwnd as *mut c_void);
+                    drop(guard);
+                    let _ = PostMessageW(Some(hwnd), WM_FFT_READY, WPARAM(0), LPARAM(0));
+                }
+
                 let space = buffer.len() - buffer_head;
                 let n = (samples.len() - sample_idx).min(space);
                 buffer[buffer_head..buffer_head + n]
                     .copy_from_slice(&samples[sample_idx..sample_idx + n]);
                 buffer_head += n;
                 sample_idx += n;
-
-                // If buffer is full, process STFT and shift for overlap
-                if buffer_head >= buffer.len() && !state.lock().unwrap().is_paused {
-                    let mag_column = process(&buffer, &hann_window, &fft);
-                    let rgba_column: Vec<u8> = mag_column
-                        .iter()
-                        .flat_map(|&mag| sample_to_color(mag))
-                        .collect();
-                    // Shift buffer by HOP_SIZE for overlap
-                    buffer.copy_within(HOP_SIZE.., 0);
-                    buffer_head = FFT_SIZE - HOP_SIZE;
-
-                    // Write new row into ring buffer (no shifting needed)
-                    const W: usize = FFT_SIZE / 2;
-                    {
-                        let mut guard = state.lock().unwrap();
-                        guard.ring_head = (guard.ring_head + TIME_FRAMES - 1) % TIME_FRAMES;
-                        let row = guard.ring_head;
-                        guard.image_data[row * W * 4..(row + 1) * W * 4]
-                            .copy_from_slice(&rgba_column);
-                        guard.magnitudes[row * W..(row + 1) * W].copy_from_slice(&mag_column);
-                    }
-                }
             }
-
-            capture.ReleaseBuffer(frames)?;
         }
     }
 }
 
 struct AppState {
+    hwnd: isize,
     image_data: Vec<u8>,
     magnitudes: Vec<f32>,
+    image_generation: u64,
     ring_head: usize,
     sample_rate: u32,
     dragging: bool,
@@ -521,6 +591,7 @@ struct AppState {
 struct WindowState {
     state: Arc<Mutex<AppState>>,
     renderer: D2DRenderer,
+    last_image_generation: u64,
 }
 
 fn run_app() -> ResultAny {
@@ -530,8 +601,10 @@ fn run_app() -> ResultAny {
         let d2d_renderer = D2DRenderer::new(window.hwnd(), FFT_SIZE, TIME_FRAMES)?;
 
         let state = Arc::new(Mutex::new(AppState {
+            hwnd: window.hwnd().0 as isize,
             image_data: vec![0u8; (FFT_SIZE / 2) * TIME_FRAMES * 4],
             magnitudes: vec![0.0; (FFT_SIZE / 2) * TIME_FRAMES],
+            image_generation: 0,
             ring_head: 0,
             sample_rate: 48000,
             dragging: false,
@@ -548,6 +621,7 @@ fn run_app() -> ResultAny {
         let ws = Box::new(WindowState {
             state: state.clone(),
             renderer: d2d_renderer,
+            last_image_generation: u64::MAX,
         });
         window.set_user_data(Box::into_raw(ws) as isize);
 
@@ -557,12 +631,29 @@ fn run_app() -> ResultAny {
             }
         });
 
-        while window.handle_events() {
-            let _ = InvalidateRect(Some(window.hwnd()), None, false);
-            let _ = DwmFlush();
-        }
+        let frame_period = Duration::from_nanos(1_000_000_000 / UI_FPS as u64);
+        let mut next_frame = Instant::now();
 
-        CoUninitialize();
+        while window.handle_events() {
+            let now = Instant::now();
+            if now >= next_frame {
+                let _ = InvalidateRect(Some(window.hwnd()), None, false);
+
+                // Keep UI-only updates responsive at the target display rate.
+                // The FFT image itself is staged only when image_generation
+                // changes, so this does not repeatedly copy the 4 MiB spectrum
+                // buffer.
+                next_frame += frame_period;
+                if next_frame <= now {
+                    // Do not accumulate lateness after a blocked or slow frame.
+                    next_frame = now + frame_period;
+                }
+            } else {
+                // Wake immediately for input, but otherwise wait until the next
+                // frame deadline instead of polling at maximum speed.
+                window.wait_for_events(next_frame - now);
+            }
+        }
     }
 
     Ok(())
